@@ -1,5 +1,7 @@
+import asyncio
 import os
 import tempfile
+import time
 from os import getcwd
 from pathlib import Path
 from typing import Any, Literal
@@ -12,7 +14,12 @@ from astrbot.api import logger
 
 TEMPLATES_PATH = str(Path(__file__).parent / "templates")
 
+# 记录此模块创建的临时文件
 _temp_files: set[str] = set()
+# 可选映射，记录创建时间以便基于年龄的清理
+_temp_mtime: dict[str, float] = {}
+# 锁用于保护对 _temp_files/_temp_mtime 的并发访问
+_temp_lock = asyncio.Lock()
 
 
 async def read_file(path: str) -> str:
@@ -48,23 +55,38 @@ async def html_to_pic(
     tmp_path = tmp.name
     tmp.close()
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page(device_scale_factor=device_scale_factor, **kwargs)
-        page.on("console", lambda msg: logger.debug(f"[Browser Console]: {msg.text}"))
-        await page.goto(template_path)
-        await page.set_content(html, wait_until="networkidle")
-        await page.wait_for_timeout(wait)
-        await page.screenshot(
-            path=tmp_path,
-            full_page=full_page,
-            type=type,
-            quality=quality,
-            timeout=screenshot_timeout,
-        )
-        await browser.close()
+    # 立即记录生成的文件，以避免后续异常导致泄漏
+    async with _temp_lock:
+        _temp_files.add(tmp_path)
+        _temp_mtime[tmp_path] = time.time()
 
-    _temp_files.add(tmp_path)
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch()
+            page = await browser.new_page(device_scale_factor=device_scale_factor, **kwargs)
+            page.on("console", lambda msg: logger.debug(f"[Browser Console]: {msg.text}"))
+            await page.goto(template_path)
+            await page.set_content(html, wait_until="networkidle")
+            await page.wait_for_timeout(wait)
+            await page.screenshot(
+                path=tmp_path,
+                full_page=full_page,
+                type=type,
+                quality=quality,
+                timeout=screenshot_timeout,
+            )
+            await browser.close()
+    except Exception:
+        # 如果出错，尝试立即清理该临时文件
+        try:
+            os.remove(tmp_path)
+        except Exception as e:
+            logger.warning(f"在错误后删除临时文件失败：{tmp_path} ({e})")
+        async with _temp_lock:
+            _temp_files.discard(tmp_path)
+            _temp_mtime.pop(tmp_path, None)
+        raise
+
     return tmp_path
 
 
@@ -119,11 +141,30 @@ async def template_to_pic(
     )
 
 
-async def cleanup_tempfiles() -> None:
-    for p in list(_temp_files):
+async def cleanup_tempfiles(age_seconds: float | None = None) -> None:
+    """删除所有已跟踪的临时文件。
+
+    如果 ``age_seconds`` 提供，将只删除至少存在该秒数的文件。
+    这对于避免误删仍可能被使用的最新文件有帮助。
+    """
+    now = time.time()
+    async with _temp_lock:
+        paths = list(_temp_files)
+
+    for p in paths:
+        if age_seconds is not None:
+            created = _temp_mtime.get(p, now)
+            if now - created < age_seconds:
+                # 跳过较新文件
+                continue
         try:
             os.remove(p)
-        except Exception:
-            logger.warning(f"删除临时文件失败：{p}")
+        except FileNotFoundError:
+            # 已经不存在，无需处理
+            logger.debug(f"清理时未找到临时文件：{p}")
+        except Exception as e:
+            logger.warning(f"删除临时文件失败：{p} ({e})")
         finally:
-            _temp_files.discard(p)
+            async with _temp_lock:
+                _temp_files.discard(p)
+                _temp_mtime.pop(p, None)
